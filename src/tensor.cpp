@@ -8,7 +8,10 @@
 #include <fstream>
 #include <limits>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace synapse {
 
@@ -63,6 +66,7 @@ Tensor::Shape broadcast_shape(const Tensor::Shape& lhs, const Tensor::Shape& rhs
 }
 
 std::shared_ptr<MemoryPool> g_memory_pool;
+thread_local bool g_grad_enabled = true;
 
 enum class BinaryOp {
     Add,
@@ -301,6 +305,145 @@ Tensor reduce_op(const Tensor& input, std::optional<size_t> axis, bool keepdims,
     return out;
 }
 
+Tensor filled_tensor(const Tensor::Shape& shape, DType dtype, double value) {
+    Tensor out(shape, dtype, Tensor::global_memory_pool());
+    size_t count = out.numel();
+    if (count == 0) {
+        return out;
+    }
+    if (out.is_contiguous()) {
+        switch (dtype) {
+            case DType::Float32: {
+                auto* data = out.data<float>();
+                std::fill(data, data + count, static_cast<float>(value));
+                return out;
+            }
+            case DType::Float64: {
+                auto* data = out.data<double>();
+                std::fill(data, data + count, value);
+                return out;
+            }
+            case DType::Int32: {
+                auto* data = out.data<int32_t>();
+                std::fill(data, data + count, static_cast<int32_t>(value));
+                return out;
+            }
+            case DType::Int64: {
+                auto* data = out.data<int64_t>();
+                std::fill(data, data + count, static_cast<int64_t>(value));
+                return out;
+            }
+            default:
+                break;
+        }
+    }
+
+    std::vector<size_t> index(out.shape().size(), 0);
+    for (size_t i = 0; i < count; ++i) {
+        write_value(out, offset_for_index(out, index), value);
+        increment_index(index, out.shape());
+    }
+    return out;
+}
+
+Tensor reduce_to_shape(const Tensor& grad, const Tensor::Shape& shape) {
+    if (grad.shape() == shape) {
+        return grad;
+    }
+    if (shape.empty()) {
+        return sum(grad);
+    }
+    Tensor result = grad;
+    size_t out_ndim = result.shape().size();
+    size_t in_ndim = shape.size();
+    if (out_ndim < in_ndim) {
+        throw std::invalid_argument("Cannot reduce grad to larger rank");
+    }
+    size_t offset = out_ndim - in_ndim;
+    for (size_t i = 0; i < out_ndim; ++i) {
+        size_t in_dim = (i < offset) ? 1 : shape[i - offset];
+        if (in_dim == 1 && result.shape()[i] != 1) {
+            result = sum(result, i, true);
+        }
+    }
+    if (result.shape() != shape) {
+        result = result.reshape(shape);
+    }
+    return result;
+}
+
+Tensor sum_backward(const Tensor& input, const Tensor& grad_out, std::optional<size_t> axis, bool keepdims) {
+    Tensor grad = grad_out;
+    if (axis.has_value() && !keepdims) {
+        Tensor::Shape grad_shape = input.shape();
+        grad_shape[axis.value()] = 1;
+        grad = grad_out.reshape(grad_shape);
+    }
+    return grad.broadcast_to(input.shape());
+}
+
+Tensor max_backward(const Tensor& input, const Tensor& output, const Tensor& grad_out, std::optional<size_t> axis, bool keepdims) {
+    Tensor grad = filled_tensor(input.shape(), input.dtype(), 0.0);
+    if (input.numel() == 0) {
+        return grad;
+    }
+    size_t out_numel = output.numel();
+    std::vector<size_t> counts(out_numel, 0);
+    std::vector<size_t> index(input.shape().size(), 0);
+    std::vector<size_t> out_index;
+    out_index.reserve(output.shape().size());
+
+    for (size_t i = 0; i < input.numel(); ++i) {
+        size_t out_offset = 0;
+        if (axis.has_value()) {
+            out_index.clear();
+            for (size_t d = 0; d < input.shape().size(); ++d) {
+                if (d == axis.value()) {
+                    if (keepdims) {
+                        out_index.push_back(0);
+                    }
+                } else {
+                    out_index.push_back(index[d]);
+                }
+            }
+            out_offset = offset_for_index(output, out_index);
+        }
+        double in_val = read_value(input, offset_for_index(input, index));
+        double out_val = read_value(output, out_offset);
+        if (in_val == out_val) {
+            counts[out_offset] += 1;
+        }
+        increment_index(index, input.shape());
+    }
+
+    index.assign(input.shape().size(), 0);
+    for (size_t i = 0; i < input.numel(); ++i) {
+        size_t out_offset = 0;
+        if (axis.has_value()) {
+            out_index.clear();
+            for (size_t d = 0; d < input.shape().size(); ++d) {
+                if (d == axis.value()) {
+                    if (keepdims) {
+                        out_index.push_back(0);
+                    }
+                } else {
+                    out_index.push_back(index[d]);
+                }
+            }
+            out_offset = offset_for_index(output, out_index);
+        }
+        double in_val = read_value(input, offset_for_index(input, index));
+        double out_val = read_value(output, out_offset);
+        if (in_val == out_val && counts[out_offset] > 0) {
+            double share = read_value(grad_out, out_offset) / static_cast<double>(counts[out_offset]);
+            write_value(grad, offset_for_index(grad, index), share);
+        }
+        increment_index(index, input.shape());
+    }
+
+    return grad;
+}
+
 } // namespace
 
 size_t dtype_size(DType dtype) {
@@ -518,6 +661,236 @@ void Tensor::set(const std::vector<size_t>& indices, double value) {
     write_value(*this, offset, value);
 }
 
+bool Tensor::requires_grad() const {
+    return autograd_ && autograd_->requires_grad;
+}
+
+void Tensor::set_requires_grad(bool requires_grad) {
+    if (!requires_grad) {
+        if (autograd_) {
+            autograd_->requires_grad = false;
+            autograd_->grad.reset();
+            autograd_->grad_fn.reset();
+            autograd_->hooks.clear();
+        }
+        return;
+    }
+    if (!autograd_) {
+        autograd_ = std::make_shared<AutogradMeta>();
+    }
+    autograd_->requires_grad = true;
+}
+
+const std::optional<Tensor>& Tensor::grad() const {
+    static const std::optional<Tensor> empty;
+    if (!autograd_) {
+        return empty;
+    }
+    return autograd_->grad;
+}
+
+void Tensor::zero_grad() {
+    if (autograd_) {
+        autograd_->grad.reset();
+    }
+}
+
+void Tensor::register_hook(const std::function<void(Tensor&)>& hook) {
+    if (!autograd_) {
+        autograd_ = std::make_shared<AutogradMeta>();
+    }
+    autograd_->requires_grad = true;
+    autograd_->hooks.push_back(hook);
+}
+
+Tensor Tensor::detach() const {
+    Tensor out = view();
+    out.autograd_.reset();
+    return out;
+}
+
+void Tensor::attach_grad_fn(const std::shared_ptr<GraphNode>& node) {
+    if (!autograd_) {
+        autograd_ = std::make_shared<AutogradMeta>();
+    }
+    autograd_->requires_grad = true;
+    autograd_->grad_fn = node;
+}
+
+std::shared_ptr<GraphNode> Tensor::grad_fn() const {
+    if (!autograd_) {
+        return nullptr;
+    }
+    return autograd_->grad_fn;
+}
+
+bool Tensor::grad_enabled() {
+    return g_grad_enabled;
+}
+
+void Tensor::set_grad_enabled(bool enabled) {
+    g_grad_enabled = enabled;
+}
+
+Tensor::NoGradGuard::NoGradGuard() : previous_(Tensor::grad_enabled()) {
+    Tensor::set_grad_enabled(false);
+}
+
+Tensor::NoGradGuard::~NoGradGuard() {
+    Tensor::set_grad_enabled(previous_);
+}
+
+void Tensor::backward(bool retain_graph) {
+    if (numel() != 1) {
+        throw std::invalid_argument("backward() without grad only supported for scalar tensors");
+    }
+    Tensor grad = filled_tensor({}, dtype_, 1.0);
+    backward(grad, retain_graph);
+}
+
+void Tensor::backward(const Tensor& grad, bool retain_graph) {
+    if (!requires_grad()) {
+        return;
+    }
+    if (grad.shape() != shape_) {
+        throw std::invalid_argument("Gradient shape mismatch");
+    }
+
+    auto accumulate_grad = [](Tensor& target, const Tensor& grad_value) {
+        if (!target.autograd_) {
+            target.autograd_ = std::make_shared<AutogradMeta>();
+            target.autograd_->requires_grad = true;
+        }
+        Tensor grad_copy = grad_value;
+        for (auto& hook : target.autograd_->hooks) {
+            hook(grad_copy);
+        }
+        if (!target.autograd_->grad.has_value()) {
+            target.autograd_->grad = grad_copy;
+        } else {
+            Tensor::NoGradGuard guard;
+            target.autograd_->grad = add(target.autograd_->grad.value(), grad_copy);
+        }
+    };
+
+    Tensor::NoGradGuard guard;
+    accumulate_grad(*this, grad);
+
+    if (!autograd_ || !autograd_->grad_fn) {
+        return;
+    }
+
+    std::vector<std::shared_ptr<GraphNode>> order;
+    std::unordered_set<GraphNode*> visited;
+    std::function<void(const std::shared_ptr<GraphNode>&)> dfs = [&](const std::shared_ptr<GraphNode>& node) {
+        if (!node || visited.count(node.get())) {
+            return;
+        }
+        visited.insert(node.get());
+        for (const auto& parent : node->parents) {
+            if (parent.autograd_ && parent.autograd_->grad_fn) {
+                dfs(parent.autograd_->grad_fn);
+            }
+        }
+        order.push_back(node);
+    };
+
+    dfs(autograd_->grad_fn);
+
+    std::unordered_map<GraphNode*, Tensor> grads;
+    grads[autograd_->grad_fn.get()] = grad;
+
+    for (auto it = order.rbegin(); it != order.rend(); ++it) {
+        const auto& node = *it;
+        auto grad_it = grads.find(node.get());
+        if (grad_it == grads.end()) {
+            continue;
+        }
+        if (!node->backward) {
+            continue;
+        }
+
+        std::vector<Tensor> grad_inputs = node->backward(grad_it->second);
+        size_t count = std::min(grad_inputs.size(), node->parents.size());
+        for (size_t i = 0; i < count; ++i) {
+            Tensor& parent = node->parents[i];
+            if (!parent.requires_grad()) {
+                continue;
+            }
+            accumulate_grad(parent, grad_inputs[i]);
+            if (parent.autograd_ && parent.autograd_->grad_fn) {
+                auto parent_node = parent.autograd_->grad_fn.get();
+                auto existing = grads.find(parent_node);
+                if (existing == grads.end()) {
+                    grads[parent_node] = grad_inputs[i];
+                } else {
+                    grads[parent_node] = add(existing->second, grad_inputs[i]);
+                }
+            }
+        }
+    }
+
+    if (!retain_graph) {
+        for (const auto& node : order) {
+            if (node) {
+                node->clear();
+            }
+        }
+    }
+}
+
+std::string Tensor::grad_graph_dot() const {
+    std::ostringstream out;
+    out << "digraph Autograd {\n";
+    if (!autograd_ || !autograd_->grad_fn) {
+        out << "}\n";
+        return out.str();
+    }
+
+    std::unordered_set<const GraphNode*> visited;
+    std::unordered_set<uintptr_t> leaf_seen;
+    std::vector<std::shared_ptr<GraphNode>> stack;
+    stack.push_back(autograd_->grad_fn);
+
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
+        if (!node || visited.count(node.get())) {
+            continue;
+        }
+        visited.insert(node.get());
+        auto node_id = reinterpret_cast<uintptr_t>(node.get());
+        out << "  node" << node_id << " [label=\"" << node->op << "\"];\n";
+
+        for (const auto& parent : node->parents) {
+            if (parent.autograd_ && parent.autograd_->grad_fn) {
+                auto parent_node = parent.autograd_->grad_fn;
+                out << "  node" << reinterpret_cast<uintptr_t>(parent_node.get()) << " -> node" << node_id << ";\n";
+                stack.push_back(parent_node);
+            } else {
+                const AutogradMeta* meta = parent.autograd_.get();
+                uintptr_t leaf_id = meta ? reinterpret_cast<uintptr_t>(meta)
+                                         : reinterpret_cast<uintptr_t>(parent.data_.get());
+                if (!leaf_seen.count(leaf_id)) {
+                    out << "  leaf" << leaf_id << " [shape=box,label=\"leaf\"];\n";
+                    leaf_seen.insert(leaf_id);
+                }
+                out << "  leaf" << leaf_id << " -> node" << node_id << ";\n";
+            }
+        }
+    }
+
+    out << "}\n";
+    return out.str();
+}
+
+void GraphNode::clear() {
+    parents.clear();
+    children.clear();
+    saved_tensors.clear();
+    backward = nullptr;
+}
+
 std::vector<uint8_t> Tensor::serialize() const {
     Tensor contig = is_contiguous() ? view() : clone();
     uint64_t ndim = static_cast<uint64_t>(contig.shape_.size());
@@ -641,35 +1014,199 @@ size_t Tensor::compute_offset(const std::vector<size_t>& indices) const {
 }
 
 Tensor add(const Tensor& lhs, const Tensor& rhs) {
-    return elementwise_binary(lhs, rhs, BinaryOp::Add);
+    Tensor out = elementwise_binary(lhs, rhs, BinaryOp::Add);
+    if (Tensor::grad_enabled() && (lhs.requires_grad() || rhs.requires_grad())) {
+        auto node = std::make_shared<GraphNode>();
+        node->op = "add";
+        node->parents = {lhs, rhs};
+        node->saved_tensors = {lhs.detach(), rhs.detach()};
+        Tensor::Shape lhs_shape = lhs.shape();
+        Tensor::Shape rhs_shape = rhs.shape();
+        node->backward = [lhs_shape, rhs_shape](const Tensor& grad_out) {
+            Tensor::NoGradGuard guard;
+            Tensor grad_lhs = reduce_to_shape(grad_out, lhs_shape);
+            Tensor grad_rhs = reduce_to_shape(grad_out, rhs_shape);
+            return std::vector<Tensor>{grad_lhs, grad_rhs};
+        };
+        for (const auto& parent : node->parents) {
+            if (parent.grad_fn()) {
+                parent.grad_fn()->children.push_back(node);
+            }
+        }
+        out.attach_grad_fn(node);
+    }
+    return out;
 }
 
 Tensor sub(const Tensor& lhs, const Tensor& rhs) {
-    return elementwise_binary(lhs, rhs, BinaryOp::Sub);
+    Tensor out = elementwise_binary(lhs, rhs, BinaryOp::Sub);
+    if (Tensor::grad_enabled() && (lhs.requires_grad() || rhs.requires_grad())) {
+        auto node = std::make_shared<GraphNode>();
+        node->op = "sub";
+        node->parents = {lhs, rhs};
+        node->saved_tensors = {lhs.detach(), rhs.detach()};
+        Tensor::Shape lhs_shape = lhs.shape();
+        Tensor::Shape rhs_shape = rhs.shape();
+        node->backward = [lhs_shape, rhs_shape](const Tensor& grad_out) {
+            Tensor::NoGradGuard guard;
+            Tensor grad_lhs = reduce_to_shape(grad_out, lhs_shape);
+            Tensor grad_rhs = mul(reduce_to_shape(grad_out, rhs_shape), -1.0);
+            return std::vector<Tensor>{grad_lhs, grad_rhs};
+        };
+        for (const auto& parent : node->parents) {
+            if (parent.grad_fn()) {
+                parent.grad_fn()->children.push_back(node);
+            }
+        }
+        out.attach_grad_fn(node);
+    }
+    return out;
 }
 
 Tensor mul(const Tensor& lhs, const Tensor& rhs) {
-    return elementwise_binary(lhs, rhs, BinaryOp::Mul);
+    Tensor out = elementwise_binary(lhs, rhs, BinaryOp::Mul);
+    if (Tensor::grad_enabled() && (lhs.requires_grad() || rhs.requires_grad())) {
+        auto node = std::make_shared<GraphNode>();
+        node->op = "mul";
+        node->parents = {lhs, rhs};
+        Tensor lhs_saved = lhs.detach();
+        Tensor rhs_saved = rhs.detach();
+        node->saved_tensors = {lhs_saved, rhs_saved};
+        Tensor::Shape lhs_shape = lhs.shape();
+        Tensor::Shape rhs_shape = rhs.shape();
+        node->backward = [lhs_saved, rhs_saved, lhs_shape, rhs_shape](const Tensor& grad_out) {
+            Tensor::NoGradGuard guard;
+            Tensor grad_lhs = mul(grad_out, rhs_saved);
+            Tensor grad_rhs = mul(grad_out, lhs_saved);
+            grad_lhs = reduce_to_shape(grad_lhs, lhs_shape);
+            grad_rhs = reduce_to_shape(grad_rhs, rhs_shape);
+            return std::vector<Tensor>{grad_lhs, grad_rhs};
+        };
+        for (const auto& parent : node->parents) {
+            if (parent.grad_fn()) {
+                parent.grad_fn()->children.push_back(node);
+            }
+        }
+        out.attach_grad_fn(node);
+    }
+    return out;
 }
 
 Tensor div(const Tensor& lhs, const Tensor& rhs) {
-    return elementwise_binary(lhs, rhs, BinaryOp::Div);
+    Tensor out = elementwise_binary(lhs, rhs, BinaryOp::Div);
+    if (Tensor::grad_enabled() && (lhs.requires_grad() || rhs.requires_grad())) {
+        auto node = std::make_shared<GraphNode>();
+        node->op = "div";
+        node->parents = {lhs, rhs};
+        Tensor lhs_saved = lhs.detach();
+        Tensor rhs_saved = rhs.detach();
+        node->saved_tensors = {lhs_saved, rhs_saved};
+        Tensor::Shape lhs_shape = lhs.shape();
+        Tensor::Shape rhs_shape = rhs.shape();
+        node->backward = [lhs_saved, rhs_saved, lhs_shape, rhs_shape](const Tensor& grad_out) {
+            Tensor::NoGradGuard guard;
+            Tensor grad_lhs = div(grad_out, rhs_saved);
+            Tensor rhs_sq = mul(rhs_saved, rhs_saved);
+            Tensor grad_rhs = div(mul(grad_out, lhs_saved), rhs_sq);
+            grad_rhs = mul(grad_rhs, -1.0);
+            grad_lhs = reduce_to_shape(grad_lhs, lhs_shape);
+            grad_rhs = reduce_to_shape(grad_rhs, rhs_shape);
+            return std::vector<Tensor>{grad_lhs, grad_rhs};
+        };
+        for (const auto& parent : node->parents) {
+            if (parent.grad_fn()) {
+                parent.grad_fn()->children.push_back(node);
+            }
+        }
+        out.attach_grad_fn(node);
+    }
+    return out;
 }
 
 Tensor add(const Tensor& lhs, double scalar) {
-    return elementwise_scalar(lhs, scalar, BinaryOp::Add);
+    Tensor out = elementwise_scalar(lhs, scalar, BinaryOp::Add);
+    if (Tensor::grad_enabled() && lhs.requires_grad()) {
+        auto node = std::make_shared<GraphNode>();
+        node->op = "add_scalar";
+        node->parents = {lhs};
+        node->saved_tensors = {lhs.detach()};
+        Tensor::Shape lhs_shape = lhs.shape();
+        node->backward = [lhs_shape](const Tensor& grad_out) {
+            Tensor::NoGradGuard guard;
+            Tensor grad_lhs = reduce_to_shape(grad_out, lhs_shape);
+            return std::vector<Tensor>{grad_lhs};
+        };
+        if (lhs.grad_fn()) {
+            lhs.grad_fn()->children.push_back(node);
+        }
+        out.attach_grad_fn(node);
+    }
+    return out;
 }
 
 Tensor sub(const Tensor& lhs, double scalar) {
-    return elementwise_scalar(lhs, scalar, BinaryOp::Sub);
+    Tensor out = elementwise_scalar(lhs, scalar, BinaryOp::Sub);
+    if (Tensor::grad_enabled() && lhs.requires_grad()) {
+        auto node = std::make_shared<GraphNode>();
+        node->op = "sub_scalar";
+        node->parents = {lhs};
+        node->saved_tensors = {lhs.detach()};
+        Tensor::Shape lhs_shape = lhs.shape();
+        node->backward = [lhs_shape](const Tensor& grad_out) {
+            Tensor::NoGradGuard guard;
+            Tensor grad_lhs = reduce_to_shape(grad_out, lhs_shape);
+            return std::vector<Tensor>{grad_lhs};
+        };
+        if (lhs.grad_fn()) {
+            lhs.grad_fn()->children.push_back(node);
+        }
+        out.attach_grad_fn(node);
+    }
+    return out;
 }
 
 Tensor mul(const Tensor& lhs, double scalar) {
-    return elementwise_scalar(lhs, scalar, BinaryOp::Mul);
+    Tensor out = elementwise_scalar(lhs, scalar, BinaryOp::Mul);
+    if (Tensor::grad_enabled() && lhs.requires_grad()) {
+        auto node = std::make_shared<GraphNode>();
+        node->op = "mul_scalar";
+        node->parents = {lhs};
+        node->saved_tensors = {lhs.detach()};
+        Tensor::Shape lhs_shape = lhs.shape();
+        node->backward = [lhs_shape, scalar](const Tensor& grad_out) {
+            Tensor::NoGradGuard guard;
+            Tensor grad_lhs = mul(grad_out, scalar);
+            grad_lhs = reduce_to_shape(grad_lhs, lhs_shape);
+            return std::vector<Tensor>{grad_lhs};
+        };
+        if (lhs.grad_fn()) {
+            lhs.grad_fn()->children.push_back(node);
+        }
+        out.attach_grad_fn(node);
+    }
+    return out;
 }
 
 Tensor div(const Tensor& lhs, double scalar) {
-    return elementwise_scalar(lhs, scalar, BinaryOp::Div);
+    Tensor out = elementwise_scalar(lhs, scalar, BinaryOp::Div);
+    if (Tensor::grad_enabled() && lhs.requires_grad()) {
+        auto node = std::make_shared<GraphNode>();
+        node->op = "div_scalar";
+        node->parents = {lhs};
+        node->saved_tensors = {lhs.detach()};
+        Tensor::Shape lhs_shape = lhs.shape();
+        node->backward = [lhs_shape, scalar](const Tensor& grad_out) {
+            Tensor::NoGradGuard guard;
+            Tensor grad_lhs = div(grad_out, scalar);
+            grad_lhs = reduce_to_shape(grad_lhs, lhs_shape);
+            return std::vector<Tensor>{grad_lhs};
+        };
+        if (lhs.grad_fn()) {
+            lhs.grad_fn()->children.push_back(node);
+        }
+        out.attach_grad_fn(node);
+    }
+    return out;
 }
 
 Tensor matmul(const Tensor& lhs, const Tensor& rhs) {
@@ -701,11 +1238,50 @@ Tensor matmul(const Tensor& lhs, const Tensor& rhs) {
         }
     }
 
+    if (Tensor::grad_enabled() && (lhs.requires_grad() || rhs.requires_grad())) {
+        auto node = std::make_shared<GraphNode>();
+        node->op = "matmul";
+        node->parents = {lhs, rhs};
+        Tensor lhs_saved = lhs.detach();
+        Tensor rhs_saved = rhs.detach();
+        node->saved_tensors = {lhs_saved, rhs_saved};
+        node->backward = [lhs_saved, rhs_saved](const Tensor& grad_out) {
+            Tensor::NoGradGuard guard;
+            Tensor lhs_t = lhs_saved.transpose({1, 0});
+            Tensor rhs_t = rhs_saved.transpose({1, 0});
+            Tensor grad_lhs = matmul(grad_out, rhs_t);
+            Tensor grad_rhs = matmul(lhs_t, grad_out);
+            return std::vector<Tensor>{grad_lhs, grad_rhs};
+        };
+        for (const auto& parent : node->parents) {
+            if (parent.grad_fn()) {
+                parent.grad_fn()->children.push_back(node);
+            }
+        }
+        out.attach_grad_fn(node);
+    }
     return out;
 }
 
 Tensor sum(const Tensor& input, std::optional<size_t> axis, bool keepdims) {
-    return reduce_op(input, axis, keepdims, [](double a, double b) { return a + b; }, 0.0);
+    Tensor out = reduce_op(input, axis, keepdims, [](double a, double b) { return a + b; }, 0.0);
+    if (Tensor::grad_enabled() && input.requires_grad()) {
+        auto node = std::make_shared<GraphNode>();
+        node->op = "sum";
+        node->parents = {input};
+        Tensor input_saved = input.detach();
+        node->saved_tensors = {input_saved};
+        node->backward = [input_saved, axis, keepdims](const Tensor& grad_out) {
+            Tensor::NoGradGuard guard;
+            Tensor grad_input = sum_backward(input_saved, grad_out, axis, keepdims);
+            return std::vector<Tensor>{grad_input};
+        };
+        if (input.grad_fn()) {
+            input.grad_fn()->children.push_back(node);
+        }
+        out.attach_grad_fn(node);
+    }
+    return out;
 }
 
 Tensor mean(const Tensor& input, std::optional<size_t> axis, bool keepdims) {
@@ -721,7 +1297,25 @@ Tensor mean(const Tensor& input, std::optional<size_t> axis, bool keepdims) {
 
 Tensor max(const Tensor& input, std::optional<size_t> axis, bool keepdims) {
     double init = -std::numeric_limits<double>::infinity();
-    return reduce_op(input, axis, keepdims, [](double a, double b) { return std::max(a, b); }, init);
+    Tensor out = reduce_op(input, axis, keepdims, [](double a, double b) { return std::max(a, b); }, init);
+    if (Tensor::grad_enabled() && input.requires_grad()) {
+        auto node = std::make_shared<GraphNode>();
+        node->op = "max";
+        node->parents = {input};
+        Tensor input_saved = input.detach();
+        Tensor output_saved = out.detach();
+        node->saved_tensors = {input_saved, output_saved};
+        node->backward = [input_saved, output_saved, axis, keepdims](const Tensor& grad_out) {
+            Tensor::NoGradGuard guard;
+            Tensor grad_input = max_backward(input_saved, output_saved, grad_out, axis, keepdims);
+            return std::vector<Tensor>{grad_input};
+        };
+        if (input.grad_fn()) {
+            input.grad_fn()->children.push_back(node);
+        }
+        out.attach_grad_fn(node);
+    }
+    return out;
 }
 
 Tensor apply(const Tensor& input, const std::function<double(double)>& fn) {
@@ -734,7 +1328,70 @@ Tensor apply(const Tensor& input, const std::function<double(double)>& fn) {
         increment_index(index, input.shape());
     }
 
+    if (Tensor::grad_enabled() && input.requires_grad()) {
+        auto node = std::make_shared<GraphNode>();
+        node->op = "apply";
+        node->parents = {input};
+        Tensor input_saved = input.detach();
+        node->saved_tensors = {input_saved};
+        node->backward = [input_saved, fn](const Tensor& grad_out) {
+            Tensor::NoGradGuard guard;
+            Tensor grad_input(input_saved.shape(), input_saved.dtype(), Tensor::global_memory_pool());
+            if (input_saved.numel() == 0) {
+                return std::vector<Tensor>{grad_input};
+            }
+            const double eps = 1e-6;
+            std::vector<size_t> index(input_saved.shape().size(), 0);
+            for (size_t i = 0; i < input_saved.numel(); ++i) {
+                size_t offset = offset_for_index(input_saved, index);
+                double x = read_value(input_saved, offset);
+                double deriv = (fn(x + eps) - fn(x - eps)) / (2.0 * eps);
+                double grad_val = read_value(grad_out, offset_for_index(grad_out, index));
+                write_value(grad_input, offset, grad_val * deriv);
+                increment_index(index, input_saved.shape());
+            }
+            return std::vector<Tensor>{grad_input};
+        };
+        if (input.grad_fn()) {
+            input.grad_fn()->children.push_back(node);
+        }
+        out.attach_grad_fn(node);
+    }
     return out;
+}
+
+bool grad_check(const std::function<Tensor(const Tensor&)>& fn, Tensor input, double eps, double tol) {
+    input.set_requires_grad(true);
+    input.zero_grad();
+    Tensor output = fn(input);
+    if (output.numel() != 1) {
+        throw std::invalid_argument("grad_check expects scalar output");
+    }
+    output.backward();
+    const auto& grad_opt = input.grad();
+    if (!grad_opt.has_value()) {
+        return false;
+    }
+    Tensor analytical = grad_opt.value();
+
+    Tensor::NoGradGuard guard;
+    std::vector<size_t> index(input.shape().size(), 0);
+    for (size_t i = 0; i < input.numel(); ++i) {
+        double original = input.at(index);
+        input.set(index, original + eps);
+        double pos = fn(input).at({});
+        input.set(index, original - eps);
+        double neg = fn(input).at({});
+        input.set(index, original);
+        double numeric = (pos - neg) / (2.0 * eps);
+        double analytic = analytical.at(index);
+        if (std::fabs(numeric - analytic) > tol) {
+            return false;
+        }
+        increment_index(index, input.shape());
+    }
+
+    return true;
 }
 
 Tensor operator+(const Tensor& lhs, const Tensor& rhs) {
