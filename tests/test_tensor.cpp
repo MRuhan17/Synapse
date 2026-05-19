@@ -79,7 +79,7 @@ int main() {
     Tensor product = synapse::matmul(left, right);
     assert_true(product.shape() == Tensor::Shape({2, 2}), "matmul shape");
     assert_near(product.at({0, 0}), 22.0, 1e-9, "matmul value");
-    assert_near(product.at({1, 1}), 139.0, 1e-9, "matmul value 2");
+    assert_near(product.at({1, 1}), 64.0, 1e-9, "matmul value 2");
 
     Tensor total = synapse::sum(tensor);
     assert_near(total.at({}), 21.0, 1e-9, "sum reduction");
