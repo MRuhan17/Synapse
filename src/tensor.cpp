@@ -1340,7 +1340,7 @@ Tensor apply(const Tensor& input, const std::function<double(double)>& fn) {
             if (input_saved.numel() == 0) {
                 return std::vector<Tensor>{grad_input};
             }
-            const double eps = 1e-6;
+            const double eps = 1e-4;
             std::vector<size_t> index(input_saved.shape().size(), 0);
             for (size_t i = 0; i < input_saved.numel(); ++i) {
                 size_t offset = offset_for_index(input_saved, index);
