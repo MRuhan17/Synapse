@@ -305,6 +305,8 @@ Tensor reduce_op(const Tensor& input, std::optional<size_t> axis, bool keepdims,
     return out;
 }
 
+constexpr double kApplyGradEps = 1e-4;
+
 Tensor filled_tensor(const Tensor::Shape& shape, DType dtype, double value) {
     Tensor out(shape, dtype, Tensor::global_memory_pool());
     size_t count = out.numel();
@@ -1340,7 +1342,7 @@ Tensor apply(const Tensor& input, const std::function<double(double)>& fn) {
             if (input_saved.numel() == 0) {
                 return std::vector<Tensor>{grad_input};
             }
-            const double eps = 1e-4;
+            const double eps = kApplyGradEps;
             std::vector<size_t> index(input_saved.shape().size(), 0);
             for (size_t i = 0; i < input_saved.numel(); ++i) {
                 size_t offset = offset_for_index(input_saved, index);

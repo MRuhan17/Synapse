@@ -22,7 +22,7 @@ void assert_near(double lhs, double rhs, double tol, const char* message) {
     }
 }
 
-Tensor make_sequential_tensor(const Tensor::Shape& shape, double start) {
+Tensor make_sequential_values_tensor(const Tensor::Shape& shape, double start) {
     Tensor out(shape);
     double value = start;
     std::vector<size_t> index(shape.size(), 0);
@@ -61,8 +61,8 @@ int main() {
     assert_near(grad_x->at({0, 0}), 2.0, 1e-9, "grad value");
     assert_near(grad_x->at({1, 1}), 2.0, 1e-9, "grad value 2");
 
-    Tensor a = make_sequential_tensor({2, 3}, 1.0);
-    Tensor b = make_sequential_tensor({3}, 1.0);
+    Tensor a = make_sequential_values_tensor({2, 3}, 1.0);
+    Tensor b = make_sequential_values_tensor({3}, 1.0);
     a.set_requires_grad(true);
     b.set_requires_grad(true);
     Tensor broadcast = a + b;
@@ -122,7 +122,7 @@ int main() {
     acc_out.backward();
     assert_near(acc.grad()->at({0}), grad_first, 1e-9, "retain_graph keeps backward");
 
-    Tensor gc = make_sequential_tensor({2, 2}, 0.5);
+    Tensor gc = make_sequential_values_tensor({2, 2}, 0.5);
     bool check_ok = synapse::grad_check([](const Tensor& t) { return synapse::sum(t * t); }, gc);
     assert_true(check_ok, "grad_check");
 
