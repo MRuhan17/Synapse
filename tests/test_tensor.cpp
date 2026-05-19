@@ -64,16 +64,16 @@ int main() {
 
     Tensor left({2, 3});
     Tensor right({3, 2});
-    double fill = 1.0;
+    double left_value = 1.0;
     for (size_t i = 0; i < 2; ++i) {
         for (size_t j = 0; j < 3; ++j) {
-            left.set({i, j}, fill++);
+            left.set({i, j}, left_value++);
         }
     }
-    fill = 1.0;
+    double right_value = 1.0;
     for (size_t i = 0; i < 3; ++i) {
         for (size_t j = 0; j < 2; ++j) {
-            right.set({i, j}, fill++);
+            right.set({i, j}, right_value++);
         }
     }
     Tensor product = synapse::matmul(left, right);

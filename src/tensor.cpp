@@ -691,19 +691,13 @@ Tensor matmul(const Tensor& lhs, const Tensor& rhs) {
 
     for (size_t i = 0; i < m; ++i) {
         for (size_t j = 0; j < n; ++j) {
-            write_value(out, i * out.strides()[0] + j * out.strides()[1], 0.0);
-        }
-    }
-
-    for (size_t i = 0; i < m; ++i) {
-        for (size_t kk = 0; kk < k; ++kk) {
-            double a_val = read_value(lhs, i * lhs.strides()[0] + kk * lhs.strides()[1]);
-            for (size_t j = 0; j < n; ++j) {
-                size_t out_offset = i * out.strides()[0] + j * out.strides()[1];
-                double current = read_value(out, out_offset);
-                double b_val = read_value(rhs, kk * rhs.strides()[0] + j * rhs.strides()[1]);
-                write_value(out, out_offset, current + a_val * b_val);
+            double acc = 0.0;
+            for (size_t k_idx = 0; k_idx < k; ++k_idx) {
+                double a_val = read_value(lhs, i * lhs.strides()[0] + k_idx * lhs.strides()[1]);
+                double b_val = read_value(rhs, k_idx * rhs.strides()[0] + j * rhs.strides()[1]);
+                acc += a_val * b_val;
             }
+            write_value(out, i * out.strides()[0] + j * out.strides()[1], acc);
         }
     }
 
