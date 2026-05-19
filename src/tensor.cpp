@@ -684,7 +684,7 @@ Tensor matmul(const Tensor& lhs, const Tensor& rhs) {
     }
 
     size_t m = lhs.shape()[0];
-    size_t k = lhs.shape()[1];
+    size_t k_dim = lhs.shape()[1];
     size_t n = rhs.shape()[1];
 
     Tensor out({m, n}, lhs.dtype(), Tensor::global_memory_pool());
@@ -692,9 +692,9 @@ Tensor matmul(const Tensor& lhs, const Tensor& rhs) {
     for (size_t i = 0; i < m; ++i) {
         for (size_t j = 0; j < n; ++j) {
             double acc = 0.0;
-            for (size_t k_idx = 0; k_idx < k; ++k_idx) {
-                double a_val = read_value(lhs, i * lhs.strides()[0] + k_idx * lhs.strides()[1]);
-                double b_val = read_value(rhs, k_idx * rhs.strides()[0] + j * rhs.strides()[1]);
+            for (size_t k = 0; k < k_dim; ++k) {
+                double a_val = read_value(lhs, i * lhs.strides()[0] + k * lhs.strides()[1]);
+                double b_val = read_value(rhs, k * rhs.strides()[0] + j * rhs.strides()[1]);
                 acc += a_val * b_val;
             }
             write_value(out, i * out.strides()[0] + j * out.strides()[1], acc);
