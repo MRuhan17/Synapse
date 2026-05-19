@@ -21,6 +21,14 @@ if(SYNAPSE_BUILD_TESTS)
     add_executable(synapse_tests tests/test_tensor.cpp)
     target_link_libraries(synapse_tests PRIVATE synapse)
     add_test(NAME synapse_tests COMMAND synapse_tests)
+
+    add_executable(synapse_autograd_tests tests/test_autograd.cpp)
+    target_link_libraries(synapse_autograd_tests PRIVATE synapse)
+    add_test(NAME synapse_autograd_tests COMMAND synapse_autograd_tests)
+
+    add_executable(synapse_autograd_stress tests/test_autograd_stress.cpp)
+    target_link_libraries(synapse_autograd_stress PRIVATE synapse)
+    add_test(NAME synapse_autograd_stress COMMAND synapse_autograd_stress)
 endif()
 
 if(SYNAPSE_BUILD_BENCHMARKS)

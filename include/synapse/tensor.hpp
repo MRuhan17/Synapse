@@ -22,6 +22,9 @@ enum class DType : uint8_t {
 size_t dtype_size(DType dtype);
 std::string dtype_name(DType dtype);
 
+struct AutogradMeta;
+struct GraphNode;
+
 struct Slice {
     size_t start;
     size_t end;
@@ -57,6 +60,34 @@ public:
     double at(const std::vector<size_t>& indices) const;
     void set(const std::vector<size_t>& indices, double value);
 
+    bool requires_grad() const;
+    void set_requires_grad(bool requires_grad);
+    const std::optional<Tensor>& grad() const;
+    void zero_grad();
+    void backward(bool retain_graph = false);
+    void backward(const Tensor& grad, bool retain_graph = false);
+    Tensor detach() const;
+    void register_hook(const std::function<void(Tensor&)>& hook);
+    std::string grad_graph_dot() const;
+
+    void attach_grad_fn(const std::shared_ptr<GraphNode>& node);
+    std::shared_ptr<GraphNode> grad_fn() const;
+
+    static bool grad_enabled();
+    static void set_grad_enabled(bool enabled);
+
+    class NoGradGuard {
+    public:
+        NoGradGuard();
+        ~NoGradGuard();
+
+        NoGradGuard(const NoGradGuard&) = delete;
+        NoGradGuard& operator=(const NoGradGuard&) = delete;
+
+    private:
+        bool previous_;
+    };
+
     std::vector<uint8_t> serialize() const;
     static Tensor deserialize(const std::vector<uint8_t>& bytes);
     void save(const std::string& path) const;
@@ -78,11 +109,29 @@ private:
     size_t offset_{0};
     std::shared_ptr<uint8_t> data_;
     std::shared_ptr<MemoryPool> pool_;
+    std::shared_ptr<AutogradMeta> autograd_;
 
     Tensor(Shape shape, Strides strides, DType dtype, size_t offset, std::shared_ptr<uint8_t> data, std::shared_ptr<MemoryPool> pool);
 
     uint8_t* raw_data() const;
     size_t compute_offset(const std::vector<size_t>& indices) const;
+};
+
+struct AutogradMeta {
+    bool requires_grad{false};
+    std::optional<Tensor> grad;
+    std::shared_ptr<GraphNode> grad_fn;
+    std::vector<std::function<void(Tensor&)>> hooks;
+};
+
+struct GraphNode {
+    std::string op;
+    std::vector<Tensor> parents;
+    std::vector<std::weak_ptr<GraphNode>> children;
+    std::vector<Tensor> saved_tensors;
+    std::function<std::vector<Tensor>(const Tensor&)> backward;
+
+    void clear();
 };
 
 Tensor add(const Tensor& lhs, const Tensor& rhs);
@@ -102,6 +151,8 @@ Tensor mean(const Tensor& input, std::optional<size_t> axis = std::nullopt, bool
 Tensor max(const Tensor& input, std::optional<size_t> axis = std::nullopt, bool keepdims = false);
 
 Tensor apply(const Tensor& input, const std::function<double(double)>& fn);
+
+bool grad_check(const std::function<Tensor(const Tensor&)>& fn, Tensor input, double eps = 1e-4, double tol = 1e-3);
 
 Tensor operator+(const Tensor& lhs, const Tensor& rhs);
 Tensor operator-(const Tensor& lhs, const Tensor& rhs);
